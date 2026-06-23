@@ -1,6 +1,6 @@
 {
     "name": "@p2ppsr/cars-cli",
-    "version": "1.2.18",
+    "version": "1.2.19",
     "main": "dist/index.js",
     "type": "module",
     "repository": {

@@ -36,15 +36,16 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
   console.log(chalk.cyan(`Using wallet storage: ${storageUrl}`));
 
   try {
-    await retryOperation('Wallet storage initialization', async () => {
+    await retryOperation('Wallet storage provider registration', async () => {
       const signer = new WalletSigner(chain, keyDeriver, storageManager);
       const services = new Services(chain);
       const wallet = new Wallet(signer, services);
       const client = new StorageClient(wallet, storageUrl);
-      await client.makeAvailable();
+      console.log(chalk.cyan('Registering CARS wallet storage provider...'));
       await storageManager.addWalletStorageProvider(client);
       walletClient = wallet;
       authFetch = new AuthFetch(walletClient);
+      console.log(chalk.green('CARS wallet storage provider is ready.'));
     }, {
       // Wallet setup can perform non-cancellable wallet/storage/payment work. Do not
       // start overlapping setup attempts after a timeout; let the calling workflow
@@ -55,7 +56,7 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
     });
   } catch (error: any) {
     const message = [
-      `Wallet storage initialization failed for CARS wallet identity ${identityKey}.`,
+      `Wallet storage provider registration failed for CARS wallet identity ${identityKey}.`,
       `Storage: ${storageUrl}.`,
       'Keep this release key and repair the underlying wallet setup, usually by funding the identity when paid storage setup or SHIP/SLAP advertisement issuance reports insufficient funds.'
     ].join(' ');
