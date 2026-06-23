@@ -26,8 +26,9 @@ let walletClient: WalletInterface = new WalletClient('auto', 'localhost')
 let authFetch = new AuthFetch(walletClient);
 
 const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', storage?: string) => {
+  const normalizedKey = normalizePrivateKey(key);
   const storageUrl = typeof storage === 'string' ? storage : defaultStorageUrl(network);
-  const keyDeriver = new KeyDeriver(new PrivateKey(key, 'hex'));
+  const keyDeriver = new KeyDeriver(new PrivateKey(normalizedKey, 'hex'));
   const identityKey = keyDeriver.identityKey;
   const storageManager = new WalletStorageManager(identityKey);
   const chain = network === 'mainnet' ? 'main' : 'test'
@@ -36,10 +37,35 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
   console.log(chalk.cyan(`Using wallet storage: ${storageUrl}`));
 
   try {
+    const signer = new WalletSigner(chain, keyDeriver, storageManager);
+    const services = new Services(chain);
+    const wallet = new Wallet(signer, services);
+
+    await retryOperation('Wallet identity derivation', async () => {
+      const { publicKey } = await wallet.getPublicKey({ identityKey: true });
+      if (publicKey !== identityKey) {
+        throw new CARSRequestError(`Wallet identity derivation returned ${publicKey}, expected ${identityKey}`);
+      }
+    }, {
+      attempts: 1,
+      timeoutMs: WALLET_STORAGE_TIMEOUT_MS,
+      retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
+    });
+
+    await retryOperation('Wallet signing check', async () => {
+      await wallet.createSignature({
+        data: [0],
+        protocolID: [0, 'CARS wallet setup'],
+        keyID: 'preflight',
+        counterparty: 'anyone'
+      });
+    }, {
+      attempts: 1,
+      timeoutMs: WALLET_STORAGE_TIMEOUT_MS,
+      retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
+    });
+
     await retryOperation('Wallet storage provider registration', async () => {
-      const signer = new WalletSigner(chain, keyDeriver, storageManager);
-      const services = new Services(chain);
-      const wallet = new Wallet(signer, services);
       const client = new StorageClient(wallet, storageUrl);
       console.log(chalk.cyan('Registering CARS wallet storage provider...'));
       await storageManager.addWalletStorageProvider(client);
@@ -62,6 +88,14 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
     ].join(' ');
     throw new CARSRequestError(message, { retryable: isRetryableError(error), body: { message }, cause: error });
   }
+}
+
+function normalizePrivateKey(key: HexString): HexString {
+  const trimmed = String(key).trim();
+  if (!/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+    throw new CARSRequestError('CARS private key must be a 64-character hex string. Keep the existing key material, but repair the repository secret formatting without rotating it.');
+  }
+  return trimmed.toLowerCase() as HexString;
 }
 
 /**
