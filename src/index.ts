@@ -27,10 +27,15 @@ let authFetch = new AuthFetch(walletClient);
 
 const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', storage?: string) => {
   const storageUrl = typeof storage === 'string' ? storage : defaultStorageUrl(network);
+  const keyDeriver = new KeyDeriver(new PrivateKey(key, 'hex'));
+  const identityKey = keyDeriver.identityKey;
+  const storageManager = new WalletStorageManager(identityKey);
+  const chain = network === 'mainnet' ? 'main' : 'test'
+
+  console.log(chalk.cyan(`Using CARS wallet identity: ${identityKey}`));
+  console.log(chalk.cyan(`Using wallet storage: ${storageUrl}`));
+
   await retryOperation('Wallet storage initialization', async () => {
-    const keyDeriver = new KeyDeriver(new PrivateKey(key, 'hex'));
-    const storageManager = new WalletStorageManager(keyDeriver.identityKey);
-    const chain = network === 'mainnet' ? 'main' : 'test'
     const signer = new WalletSigner(chain, keyDeriver, storageManager);
     const services = new Services(chain);
     const wallet = new Wallet(signer, services);
@@ -40,7 +45,10 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
     walletClient = wallet;
     authFetch = new AuthFetch(walletClient);
   }, {
-    attempts: WALLET_STORAGE_RETRIES,
+    // Wallet setup can perform non-cancellable wallet/storage/payment work. Do not
+    // start overlapping setup attempts after a timeout; let the calling workflow
+    // retry the whole command from a clean process instead.
+    attempts: 1,
     timeoutMs: REQUEST_TIMEOUT_MS,
     retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
   });
@@ -253,7 +261,21 @@ function formatError(error: any) {
   }
   if (error?.response?.data?.error) return `HTTP ${error.response.status}: ${error.response.data.error}`;
   if (error?.response?.status) return `HTTP ${error.response.status}: ${JSON.stringify(error.response.data).slice(0, 300)}`;
-  if (error?.message) return error.message;
+  if (error?.message) {
+    const parts = [`${error.name && error.name !== 'Error' ? `${error.name}: ` : ''}${error.message}`];
+    let cause = error.cause;
+    const seen = new Set();
+    while (cause && !seen.has(cause)) {
+      seen.add(cause);
+      if (cause?.message) {
+        parts.push(`caused by ${cause.name && cause.name !== 'Error' ? `${cause.name}: ` : ''}${cause.message}`);
+      } else {
+        parts.push(`caused by ${String(cause)}`);
+      }
+      cause = cause?.cause;
+    }
+    return parts.join('; ');
+  }
   return 'An unknown error occurred.';
 }
 
