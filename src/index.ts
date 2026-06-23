@@ -81,13 +81,12 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
       retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
     });
 
-    await retryOperation('Wallet storage provider registration', async () => {
-      const client = new StorageClient(wallet, storageUrl);
-      console.log(chalk.cyan('Registering CARS wallet storage provider...'));
-      await storageManager.addWalletStorageProvider(client);
-      walletClient = wallet;
-      authFetch = new AuthFetch(walletClient);
-      console.log(chalk.green('CARS wallet storage provider is ready.'));
+    const client = new StorageClient(wallet, storageUrl);
+
+    await retryOperation('Wallet storage remote availability', async () => {
+      console.log(chalk.cyan('Checking CARS wallet storage remote availability...'));
+      await client.makeAvailable();
+      console.log(chalk.green('CARS wallet storage remote is available.'));
     }, {
       // Wallet setup can perform non-cancellable wallet/storage/payment work. Do not
       // start overlapping setup attempts after a timeout; let the calling workflow
@@ -96,9 +95,21 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
       timeoutMs: WALLET_STORAGE_TIMEOUT_MS,
       retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
     });
+
+    await retryOperation('Wallet storage manager registration', async () => {
+      console.log(chalk.cyan('Registering CARS wallet storage provider with manager...'));
+      await storageManager.addWalletStorageProvider(client);
+      walletClient = wallet;
+      authFetch = new AuthFetch(walletClient);
+      console.log(chalk.green('CARS wallet storage provider is ready.'));
+    }, {
+      attempts: 1,
+      timeoutMs: WALLET_STORAGE_TIMEOUT_MS,
+      retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
+    });
   } catch (error: any) {
     const message = [
-      `Wallet storage provider registration failed for CARS wallet identity ${identityKey}.`,
+      `Wallet storage setup failed for CARS wallet identity ${identityKey}.`,
       `Storage: ${storageUrl}.`,
       'Keep this release key and repair the underlying wallet setup, usually by funding the identity when paid storage setup or SHIP/SLAP advertisement issuance reports insufficient funds.'
     ].join(' ');
