@@ -5,11 +5,12 @@ import path from 'path';
 import axios from 'axios';
 import * as tar from 'tar';
 import dns from 'dns/promises';
+import { createRequire } from 'module';
 import { spawnSync } from 'child_process';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { AuthFetch, HexString, KeyDeriver, PrivateKey, WalletClient, WalletInterface, WalletNetwork } from '@bsv/sdk';
-import { Peer } from '@bsv/sdk/auth';
+import { Peer, SimplifiedFetchTransport } from '@bsv/sdk/auth';
 import ora from 'ora';
 import Table from 'cli-table3';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -18,6 +19,7 @@ import { Agent, setGlobalDispatcher } from 'undici';
 import * as crypto from 'crypto'
 import { PrivilegedKeyManager, Services, StorageClient, Wallet, WalletSigner, WalletStorageManager } from '@bsv/wallet-toolbox-client';
 global.self = { crypto } as any
+const requireCjs = createRequire(import.meta.url)
 
 const isWindows = process.platform === 'win32'
 const npmCmd = isWindows ? 'npm.cmd' : 'npm'
@@ -42,7 +44,7 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
   try {
     const signer = new WalletSigner(chain, keyDeriver, storageManager);
     const services = new Services(chain);
-    const wallet = new Wallet(signer, services);
+    const wallet = traceWalletSetup(new Wallet(signer, services));
 
     await retryOperation('Wallet identity derivation', async () => {
       const { publicKey } = await wallet.getPublicKey({ identityKey: true });
@@ -85,7 +87,12 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
 
     await retryOperation('Wallet storage remote availability', async () => {
       console.log(chalk.cyan('Checking CARS wallet storage remote availability...'));
-      await client.makeAvailable();
+      const restoreFetchTrace = installStorageFetchTrace(storageUrl);
+      try {
+        await client.makeAvailable();
+      } finally {
+        restoreFetchTrace();
+      }
       console.log(chalk.green('CARS wallet storage remote is available.'));
     }, {
       // Wallet setup can perform non-cancellable wallet/storage/payment work. Do not
@@ -125,8 +132,98 @@ function normalizePrivateKey(key: HexString): HexString {
   return trimmed.toLowerCase() as HexString;
 }
 
+function traceWalletSetup<T extends WalletInterface>(wallet: T): T {
+  if (!walletSetupTraceEnabled()) return wallet;
+
+  const traced = wallet as any;
+  for (const method of ['getPublicKey', 'createSignature', 'verifySignature', 'createHmac', 'verifyHmac', 'createAction']) {
+    if (typeof traced[method] !== 'function') continue;
+    const original = traced[method].bind(wallet);
+    traced[method] = async (...args: any[]) => {
+      const started = Date.now();
+      console.log(chalk.gray(`CARS wallet setup: ${method} start ${formatWalletCallArgs(args[0])}`.trim()));
+      try {
+        const result = await original(...args);
+        console.log(chalk.gray(`CARS wallet setup: ${method} ok in ${Date.now() - started}ms`));
+        return result;
+      } catch (error) {
+        console.log(chalk.gray(`CARS wallet setup: ${method} failed in ${Date.now() - started}ms: ${formatError(error)}`));
+        throw error;
+      }
+    };
+  }
+
+  return wallet;
+}
+
+function formatWalletCallArgs(args: any): string {
+  if (args == null || typeof args !== 'object') return '';
+
+  const details: string[] = [];
+  if (args.identityKey === true) details.push('identityKey=true');
+  if (Array.isArray(args.protocolID)) details.push(`protocol=${String(args.protocolID[0])}:${String(args.protocolID[1])}`);
+  if (typeof args.keyID === 'string') details.push(`keyIDBytes=${Buffer.byteLength(args.keyID, 'utf8')}`);
+  if (typeof args.counterparty === 'string') details.push(`counterparty=${args.counterparty}`);
+  if (Array.isArray(args.data)) details.push(`dataBytes=${args.data.length}`);
+  if (Array.isArray(args.outputs)) details.push(`outputs=${args.outputs.length}`);
+  if (Array.isArray(args.labels)) details.push(`labels=${args.labels.length}`);
+  if (typeof args.description === 'string') details.push(`descriptionBytes=${Buffer.byteLength(args.description, 'utf8')}`);
+
+  return details.length > 0 ? `(${details.join(', ')})` : '';
+}
+
+function installStorageFetchTrace(storageUrl: string): () => void {
+  if (!walletSetupTraceEnabled()) return () => {};
+  if (typeof globalThis.fetch !== 'function') return () => {};
+
+  const storageOrigin = new URL(storageUrl).origin;
+  const originalFetch = globalThis.fetch.bind(globalThis);
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === 'string' || input instanceof URL
+      ? new URL(input)
+      : new URL(input.url);
+
+    if (url.origin !== storageOrigin) {
+      return await originalFetch(input, init);
+    }
+
+    const method = init?.method ?? (typeof input === 'object' && 'method' in input ? input.method : 'GET');
+    const started = Date.now();
+    console.log(chalk.gray(`CARS wallet setup: fetch ${method} ${url.origin}${url.pathname} start`));
+    try {
+      const response = await originalFetch(input, init);
+      console.log(chalk.gray(`CARS wallet setup: fetch ${method} ${url.origin}${url.pathname} -> ${response.status} in ${Date.now() - started}ms`));
+      return response;
+    } catch (error) {
+      console.log(chalk.gray(`CARS wallet setup: fetch ${method} ${url.origin}${url.pathname} failed in ${Date.now() - started}ms: ${formatError(error)}`));
+      throw error;
+    }
+  }) as typeof fetch;
+
+  return () => {
+    globalThis.fetch = originalFetch;
+  };
+}
+
 function installAuthHandshakeRacePatch() {
-  const prototype = Peer.prototype as any;
+  patchAuthClasses(Peer, SimplifiedFetchTransport);
+  try {
+    const cjsAuth = requireCjs('@bsv/sdk/auth');
+    patchAuthClasses(cjsAuth.Peer, cjsAuth.SimplifiedFetchTransport);
+  } catch (error) {
+    traceWalletSetupMessage(`Unable to patch CommonJS auth classes: ${formatError(error)}`);
+  }
+}
+
+function patchAuthClasses(PeerClass: any, TransportClass: any) {
+  patchAuthTransportClass(TransportClass);
+  patchPeerClass(PeerClass);
+}
+
+function patchPeerClass(PeerClass: any) {
+  const prototype = PeerClass?.prototype as any;
+  if (prototype == null) return;
   if (prototype.__carsInitialResponseRacePatch) return;
 
   const waitForInitialResponse = async function (this: any, sessionNonce: string): Promise<string> {
@@ -147,7 +244,9 @@ function installAuthHandshakeRacePatch() {
   };
 
   prototype.initiateHandshake = async function (identityKey?: string): Promise<string> {
+    traceWalletSetupMessage('Peer.initiateHandshake start');
     const sessionNonce = await createPrintableNonce(this.wallet, this.originator);
+    traceWalletSetupMessage('Peer.initiateHandshake nonce ready');
     const now = Date.now();
     const certificatesRequired = this.certificatesToRequest.certifiers.length > 0;
 
@@ -162,6 +261,7 @@ function installAuthHandshakeRacePatch() {
 
     const initialResponse = waitForInitialResponse.call(this, sessionNonce);
     try {
+      traceWalletSetupMessage('Peer.initiateHandshake initialRequest send start');
       await this.transport.send({
         version: '0.1',
         messageType: 'initialRequest',
@@ -169,14 +269,50 @@ function installAuthHandshakeRacePatch() {
         initialNonce: sessionNonce,
         requestedCertificates: this.certificatesToRequest
       });
+      traceWalletSetupMessage('Peer.initiateHandshake initialRequest send ok');
     } catch (error) {
       initialResponse.catch(() => {});
+      traceWalletSetupMessage(`Peer.initiateHandshake initialRequest send failed: ${formatError(error)}`);
       throw error;
     }
-    return await initialResponse;
+    const responseNonce = await initialResponse;
+    traceWalletSetupMessage('Peer.initiateHandshake initialResponse received');
+    return responseNonce;
   };
 
   prototype.__carsInitialResponseRacePatch = true;
+}
+
+function patchAuthTransportClass(TransportClass: any) {
+  const prototype = TransportClass?.prototype as any;
+  if (prototype == null) return;
+  if (prototype.__carsTransportTracePatch) return;
+
+  const originalSend = prototype.send;
+  prototype.send = async function (message: any): Promise<void> {
+    const messageType = typeof message?.messageType === 'string' ? message.messageType : 'unknown';
+    const baseUrl = typeof this.baseUrl === 'string' ? this.baseUrl : 'unknown';
+    const started = Date.now();
+    traceWalletSetupMessage(`SimplifiedFetchTransport.send ${messageType} ${baseUrl} start`);
+    try {
+      await originalSend.call(this, message);
+      traceWalletSetupMessage(`SimplifiedFetchTransport.send ${messageType} ${baseUrl} ok in ${Date.now() - started}ms`);
+    } catch (error) {
+      traceWalletSetupMessage(`SimplifiedFetchTransport.send ${messageType} ${baseUrl} failed in ${Date.now() - started}ms: ${formatError(error)}`);
+      throw error;
+    }
+  };
+
+  prototype.__carsTransportTracePatch = true;
+}
+
+function walletSetupTraceEnabled(): boolean {
+  return process.env.CARS_WALLET_SETUP_TRACE !== '0';
+}
+
+function traceWalletSetupMessage(message: string) {
+  if (!walletSetupTraceEnabled()) return;
+  console.log(chalk.gray(`CARS wallet setup: ${message}`));
 }
 
 async function createPrintableNonce(wallet: WalletInterface, originator?: string): Promise<string> {
