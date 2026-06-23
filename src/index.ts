@@ -11,6 +11,7 @@ import inquirer from 'inquirer';
 import { AuthFetch, HexString, KeyDeriver, PrivateKey, WalletClient, WalletInterface, WalletNetwork } from '@bsv/sdk';
 import ora from 'ora';
 import Table from 'cli-table3';
+import { Agent, setGlobalDispatcher } from 'undici';
 
 // Set up an RNG
 import * as crypto from 'crypto'
@@ -131,6 +132,7 @@ const DEFAULT_CARS_CLOUD_URL = 'https://cars.babbage.systems';
 const DEFAULT_MAINNET_STORAGE_URL = 'https://storage.babbage.systems';
 const DEFAULT_TESTNET_STORAGE_URL = 'https://staging-storage.babbage.systems';
 const REQUEST_TIMEOUT_MS = parsePositiveInt(process.env.CARS_REQUEST_TIMEOUT_MS, 120000);
+const CONNECT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_CONNECT_TIMEOUT_MS, REQUEST_TIMEOUT_MS);
 const PREFLIGHT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_PREFLIGHT_TIMEOUT_MS, 15000);
 const RELEASE_UPLOAD_TIMEOUT_MS = parsePositiveInt(process.env.CARS_UPLOAD_TIMEOUT_MS, 15 * 60 * 1000);
 const REQUEST_RETRIES = parsePositiveInt(process.env.CARS_REQUEST_RETRIES, 3);
@@ -138,6 +140,12 @@ const WALLET_STORAGE_RETRIES = parsePositiveInt(process.env.CARS_WALLET_STORAGE_
 const WALLET_STORAGE_RETRY_DELAY_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_RETRY_DELAY_MS, 3000);
 const UPLOAD_RETRIES = parsePositiveInt(process.env.CARS_UPLOAD_RETRIES, 3);
 const TOPUP_CHUNK_SATS = parsePositiveInt(process.env.CARS_TOPUP_CHUNK_SATS, 10000);
+
+setGlobalDispatcher(new Agent({
+  connectTimeout: CONNECT_TIMEOUT_MS,
+  headersTimeout: REQUEST_TIMEOUT_MS,
+  bodyTimeout: REQUEST_TIMEOUT_MS
+}));
 
 type LogPeriod = typeof VALID_LOG_PERIODS[number];
 type LogLevel = typeof VALID_LOG_LEVELS[number];
@@ -3115,18 +3123,18 @@ releaseCommand
   .option('--storage <storage>', 'Wallet storage to use with CARS')
   .description('Create a new release and automatically upload the latest artifact')
   .action(async (nameOrIndex, options) => {
-    if (options.key) {
-      await remakeWallet(options.key, options.network, options.storage)
-    }
-    const info = loadCARSConfigInfo();
-    const cfg = await pickCARSConfig(info, nameOrIndex);
-
-    if (!cfg.projectID) {
-      console.error(chalk.red('❌ No project ID set.'));
-      process.exit(1);
-    }
-
     try {
+      if (options.key) {
+        await remakeWallet(options.key, options.network, options.storage)
+      }
+      const info = loadCARSConfigInfo();
+      const cfg = await pickCARSConfig(info, nameOrIndex);
+
+      if (!cfg.projectID) {
+        console.error(chalk.red('❌ No project ID set.'));
+        process.exit(1);
+      }
+
       await runCARSPreflight(cfg, undefined, options.storage);
       await releaseLatestArtifact(cfg);
     } catch (error) {
