@@ -770,7 +770,7 @@ function isRetryableError(error: any) {
   if (error?.response?.status) return isRetryableStatus(error.response.status);
   const code = error?.code || error?.cause?.code;
   return ['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_SOCKET'].includes(code) ||
-    /timeout|fetch failed|network|socket|terminated/i.test(error?.message || '');
+    /timeout|fetch failed|network|socket|terminated|curl exited (52|55|56)/i.test(error?.message || '');
 }
 
 function formatError(error: any) {
@@ -1473,14 +1473,14 @@ async function safeRequest<T = any>(client: AuthFetch, baseUrl: string, endpoint
   }
 }
 
-async function requiredRequest<T = any>(client: AuthFetch, baseUrl: string, endpoint: string, data: any, contextMsg?: string): Promise<T> {
+async function requiredRequest<T = any>(client: AuthFetch, baseUrl: string, endpoint: string, data: any, contextMsg?: string, retryOptions: RetryOptions = {}): Promise<T> {
   return await authFetchJson<T>(client, `${normalizeBaseUrl(baseUrl)}${endpoint}`, {
     method: 'POST',
     headers: {
       'content-type': 'application/json'
     },
     body: JSON.stringify(data)
-  }, contextMsg || `Request to ${endpoint}`);
+  }, contextMsg || `Request to ${endpoint}`, retryOptions);
 }
 
 /**
@@ -1961,7 +1961,19 @@ async function getProjectInfo(config: CARSConfig): Promise<ProjectInfo> {
     throw new Error('No project ID set.');
   }
   const client = await buildAuthFetch(config);
+  return await getProjectInfoWithClient(client, config);
+}
+
+async function getProjectInfoWithClient(client: AuthFetch, config: CARSConfig): Promise<ProjectInfo> {
+  if (!config.projectID) {
+    throw new Error('No project ID set.');
+  }
   return await requiredRequest<ProjectInfo>(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/info`, {}, 'Project info');
+}
+
+async function getProjectBalanceWithClient(client: AuthFetch, config: CARSConfig): Promise<number> {
+  const info = await getProjectInfoWithClient(client, config);
+  return Number(info.billing?.balance ?? 0);
 }
 
 async function assertProjectBalanceAtLeast(config: CARSConfig, minBalance: number): Promise<ProjectInfo> {
@@ -2001,7 +2013,7 @@ async function ensureProjectBalance(config: CARSConfig, minBalance: number, topU
   }
 
   console.log(chalk.yellow(`Project balance is below ${minBalance} sats; topping up ${topUpAmount} sats to target ${topUpTo}.`));
-  await topUpProjectBalanceByAmount(config, topUpAmount);
+  await topUpProjectBalanceByAmount(config, topUpAmount, topUpTo);
 
   info = await getProjectInfo(config);
   balance = Number(info.billing?.balance ?? 0);
@@ -2036,23 +2048,65 @@ async function getTopUpChunkSize(client: AuthFetch, config: CARSConfig): Promise
   return Math.max(1, Math.min(maxAmount, TOPUP_CHUNK_SATS));
 }
 
-async function topUpProjectBalanceByAmount(config: CARSConfig, amount: number) {
+async function topUpProjectBalanceByAmount(config: CARSConfig, amount: number, targetBalance?: number) {
   if (!config.projectID) {
     console.error(chalk.red('❌ No project ID set.'));
     process.exit(1);
   }
   const client = await buildAuthFetch(config);
   const chunkSize = await getTopUpChunkSize(client, config);
-  let remaining = amount;
+  const startingBalance = await getProjectBalanceWithClient(client, config);
+  const finalTargetBalance = Math.max(targetBalance ?? startingBalance + amount, startingBalance);
+  const targetCredit = finalTargetBalance - startingBalance;
   let credited = 0;
+  let observedBalance = startingBalance;
+  let stalledAttempts = 0;
 
-  while (remaining > 0) {
+  while (observedBalance < finalTargetBalance) {
+    const remaining = finalTargetBalance - observedBalance;
     const chunk = Math.min(remaining, chunkSize);
-    const result = await requiredRequest<any>(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/pay`, { amount: chunk }, `Top up ${chunk} sats`);
-    const data = extractData<any>(result);
-    credited += Number(data?.amount || chunk);
-    remaining -= chunk;
-    console.log(chalk.green(`✅ Credited ${chunk} sats (${credited}/${amount}).`));
+    try {
+      const result = await requiredRequest<any>(
+        client,
+        config.CARSCloudURL,
+        `/api/v1/project/${config.projectID}/pay`,
+        { amount: chunk },
+        `Top up ${chunk} sats`,
+        { attempts: 1 }
+      );
+      const data = extractData<any>(result);
+      const creditedChunk = Number(data?.amount || chunk);
+      credited += creditedChunk;
+      observedBalance += creditedChunk;
+      stalledAttempts = 0;
+      console.log(chalk.green(`✅ Credited ${creditedChunk} sats (${credited}/${targetCredit}).`));
+    } catch (error: any) {
+      if (!isRetryableError(error)) throw error;
+
+      console.error(chalk.yellow(`Top-up payment response failed transiently; reconciling project balance before retrying: ${formatError(error)}`));
+      await sleep(WALLET_STORAGE_RETRY_DELAY_MS * (stalledAttempts + 1));
+      const reconciledBalance = await getProjectBalanceWithClient(client, config);
+      const reconciledCredit = Math.max(0, reconciledBalance - observedBalance);
+
+      if (reconciledCredit > 0) {
+        credited += reconciledCredit;
+        observedBalance = reconciledBalance;
+        stalledAttempts = 0;
+        console.log(chalk.green(`✅ Reconciled ${reconciledCredit} sats after transient payment response failure (${credited}/${targetCredit}).`));
+        continue;
+      }
+
+      stalledAttempts += 1;
+      if (stalledAttempts >= REQUEST_RETRIES) {
+        throw new CARSRequestError(`Top up ${chunk} sats failed after ${stalledAttempts} reconciled attempts`, {
+          endpoint: `${config.CARSCloudURL}/api/v1/project/${config.projectID}/pay`,
+          retryable: true,
+          cause: error
+        });
+      }
+
+      console.error(chalk.yellow(`No project balance change observed after transient payment failure (${stalledAttempts}/${REQUEST_RETRIES}); retrying payment chunk.`));
+    }
   }
 
   console.log(chalk.green(`✅ Balance topped up by ${credited} sats.`));

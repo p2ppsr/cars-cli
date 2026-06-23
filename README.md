@@ -248,7 +248,7 @@ cars global-info
 - **`cars project webui-config:delete <key> [nameOrIndex]`** : Delete a config key.  
 - **`cars project billing-stats [nameOrIndex]`** : View billing stats, with `--start`, `--end`, `--type`.  
 - **`cars project topup [nameOrIndex]`** : Top up project balance, optional `--amount`.  
-- **`cars project ensure-balance [nameOrIndex] --min <sats> [--topup-to <sats>]`** : Non-interactive CI/CD balance guard. Fails when the project is below `--min`, or tops up through CARS accounting to `--topup-to` before continuing.
+- **`cars project ensure-balance [nameOrIndex] --min <sats> [--topup-to <sats>]`** : Non-interactive CI/CD balance guard. Fails when the project is below `--min`, or tops up through CARS accounting to `--topup-to` before continuing. Paid top-up retries reconcile against the project balance so CI can recover from ambiguous response-read failures without blindly replaying paid requests.
 - **`cars project delete [nameOrIndex]`** : Delete project (confirmation required, or use `--force`).
 
 **Release Management**  
