@@ -83,28 +83,32 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
       retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
     });
 
-    const client = new StorageClient(wallet, storageUrl);
+    let client: StorageClient | undefined;
 
     await retryOperation('Wallet storage remote availability', async () => {
       console.log(chalk.cyan('Checking CARS wallet storage remote availability...'));
+      const candidate = new StorageClient(wallet, storageUrl);
       const restoreFetchTrace = installStorageFetchTrace(storageUrl);
       try {
-        await client.makeAvailable();
+        await candidate.makeAvailable();
+        client = candidate;
       } finally {
         restoreFetchTrace();
       }
       console.log(chalk.green('CARS wallet storage remote is available.'));
     }, {
-      // Wallet setup can perform non-cancellable wallet/storage/payment work. Do not
-      // start overlapping setup attempts after a timeout; let the calling workflow
-      // retry the whole command from a clean process instead.
-      attempts: 1,
+      // Each attempt uses a fresh StorageClient and the transport patch aborts
+      // stuck auth fetches, so retries do not reuse poisoned auth state.
+      attempts: WALLET_STORAGE_ATTEMPTS,
       timeoutMs: WALLET_STORAGE_TIMEOUT_MS,
       retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
     });
 
     await retryOperation('Wallet storage manager registration', async () => {
       console.log(chalk.cyan('Registering CARS wallet storage provider with manager...'));
+      if (client == null) {
+        throw new CARSRequestError('Wallet storage remote availability did not return a client');
+      }
       await storageManager.addWalletStorageProvider(client);
       walletClient = wallet;
       authFetch = new AuthFetch(walletClient);
@@ -229,10 +233,11 @@ function patchPeerClass(PeerClass: any) {
   const waitForInitialResponse = async function (this: any, sessionNonce: string): Promise<string> {
     return await new Promise((resolve, reject) => {
       let callbackID: number;
+      const initialResponseTimeoutMs = Math.max(AUTH_FETCH_TIMEOUT_MS + 10000, 30000);
       const timer = setTimeout(() => {
         this.stopListeningForInitialResponses(callbackID);
         reject(new Error(`Timed out waiting for initial auth response for session ${sessionNonce}`));
-      }, 30000);
+      }, initialResponseTimeoutMs);
       (timer as any).unref?.();
 
       callbackID = this.listenForInitialResponse(sessionNonce, (nonce: string) => {
@@ -445,9 +450,10 @@ const REQUEST_TIMEOUT_MS = parsePositiveInt(process.env.CARS_REQUEST_TIMEOUT_MS,
 const CONNECT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_CONNECT_TIMEOUT_MS, REQUEST_TIMEOUT_MS);
 const PREFLIGHT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_PREFLIGHT_TIMEOUT_MS, 15000);
 const WALLET_STORAGE_TIMEOUT_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_TIMEOUT_MS, Math.min(REQUEST_TIMEOUT_MS, 120000));
-const AUTH_FETCH_TIMEOUT_MS = parsePositiveInt(process.env.CARS_AUTH_FETCH_TIMEOUT_MS, Math.min(REQUEST_TIMEOUT_MS, 30000));
+const AUTH_FETCH_TIMEOUT_MS = parsePositiveInt(process.env.CARS_AUTH_FETCH_TIMEOUT_MS, Math.min(REQUEST_TIMEOUT_MS, 20000));
 const RELEASE_UPLOAD_TIMEOUT_MS = parsePositiveInt(process.env.CARS_UPLOAD_TIMEOUT_MS, 15 * 60 * 1000);
 const REQUEST_RETRIES = parsePositiveInt(process.env.CARS_REQUEST_RETRIES, 3);
+const WALLET_STORAGE_ATTEMPTS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_ATTEMPTS, 3);
 const WALLET_STORAGE_RETRY_DELAY_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_RETRY_DELAY_MS, 3000);
 const UPLOAD_RETRIES = parsePositiveInt(process.env.CARS_UPLOAD_RETRIES, 3);
 const TOPUP_CHUNK_SATS = parsePositiveInt(process.env.CARS_TOPUP_CHUNK_SATS, 10000);
