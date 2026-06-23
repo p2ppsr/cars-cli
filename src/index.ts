@@ -35,23 +35,32 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
   console.log(chalk.cyan(`Using CARS wallet identity: ${identityKey}`));
   console.log(chalk.cyan(`Using wallet storage: ${storageUrl}`));
 
-  await retryOperation('Wallet storage initialization', async () => {
-    const signer = new WalletSigner(chain, keyDeriver, storageManager);
-    const services = new Services(chain);
-    const wallet = new Wallet(signer, services);
-    const client = new StorageClient(wallet, storageUrl);
-    await client.makeAvailable();
-    await storageManager.addWalletStorageProvider(client);
-    walletClient = wallet;
-    authFetch = new AuthFetch(walletClient);
-  }, {
-    // Wallet setup can perform non-cancellable wallet/storage/payment work. Do not
-    // start overlapping setup attempts after a timeout; let the calling workflow
-    // retry the whole command from a clean process instead.
-    attempts: 1,
-    timeoutMs: REQUEST_TIMEOUT_MS,
-    retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
-  });
+  try {
+    await retryOperation('Wallet storage initialization', async () => {
+      const signer = new WalletSigner(chain, keyDeriver, storageManager);
+      const services = new Services(chain);
+      const wallet = new Wallet(signer, services);
+      const client = new StorageClient(wallet, storageUrl);
+      await client.makeAvailable();
+      await storageManager.addWalletStorageProvider(client);
+      walletClient = wallet;
+      authFetch = new AuthFetch(walletClient);
+    }, {
+      // Wallet setup can perform non-cancellable wallet/storage/payment work. Do not
+      // start overlapping setup attempts after a timeout; let the calling workflow
+      // retry the whole command from a clean process instead.
+      attempts: 1,
+      timeoutMs: WALLET_STORAGE_TIMEOUT_MS,
+      retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
+    });
+  } catch (error: any) {
+    const message = [
+      `Wallet storage initialization failed for CARS wallet identity ${identityKey}.`,
+      `Storage: ${storageUrl}.`,
+      'Keep this release key and repair the underlying wallet setup, usually by funding the identity when paid storage setup or SHIP/SLAP advertisement issuance reports insufficient funds.'
+    ].join(' ');
+    throw new CARSRequestError(message, { retryable: isRetryableError(error), body: { message }, cause: error });
+  }
 }
 
 /**
@@ -142,9 +151,9 @@ const DEFAULT_TESTNET_STORAGE_URL = 'https://staging-storage.babbage.systems';
 const REQUEST_TIMEOUT_MS = parsePositiveInt(process.env.CARS_REQUEST_TIMEOUT_MS, 120000);
 const CONNECT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_CONNECT_TIMEOUT_MS, REQUEST_TIMEOUT_MS);
 const PREFLIGHT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_PREFLIGHT_TIMEOUT_MS, 15000);
+const WALLET_STORAGE_TIMEOUT_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_TIMEOUT_MS, Math.min(REQUEST_TIMEOUT_MS, 120000));
 const RELEASE_UPLOAD_TIMEOUT_MS = parsePositiveInt(process.env.CARS_UPLOAD_TIMEOUT_MS, 15 * 60 * 1000);
 const REQUEST_RETRIES = parsePositiveInt(process.env.CARS_REQUEST_RETRIES, 3);
-const WALLET_STORAGE_RETRIES = parsePositiveInt(process.env.CARS_WALLET_STORAGE_RETRIES, REQUEST_RETRIES);
 const WALLET_STORAGE_RETRY_DELAY_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_RETRY_DELAY_MS, 3000);
 const UPLOAD_RETRIES = parsePositiveInt(process.env.CARS_UPLOAD_RETRIES, 3);
 const TOPUP_CHUNK_SATS = parsePositiveInt(process.env.CARS_TOPUP_CHUNK_SATS, 10000);
@@ -177,13 +186,14 @@ class CARSRequestError extends Error {
   body?: any;
   retryable: boolean;
 
-  constructor(message: string, options: { status?: number; endpoint?: string; body?: any; retryable?: boolean } = {}) {
+  constructor(message: string, options: { status?: number; endpoint?: string; body?: any; retryable?: boolean; cause?: any } = {}) {
     super(message);
     this.name = 'CARSRequestError';
     this.status = options.status;
     this.endpoint = options.endpoint;
     this.body = options.body;
     this.retryable = Boolean(options.retryable);
+    if (options.cause) (this as any).cause = options.cause;
   }
 }
 
@@ -257,7 +267,9 @@ function formatError(error: any) {
   if (error instanceof CARSRequestError) {
     const status = error.status ? `HTTP ${error.status}` : 'network';
     const body = error.body?.error || error.body?.message || (typeof error.body === 'string' ? error.body.slice(0, 300) : undefined);
-    return `${status}: ${body || error.message}`;
+    const parts = [`${status}: ${body || error.message}`];
+    parts.push(...formatCauseChain((error as any).cause));
+    return parts.join('; ');
   }
   if (error?.response?.data?.error) return `HTTP ${error.response.status}: ${error.response.data.error}`;
   if (error?.response?.status) return `HTTP ${error.response.status}: ${JSON.stringify(error.response.data).slice(0, 300)}`;
@@ -277,6 +289,21 @@ function formatError(error: any) {
     return parts.join('; ');
   }
   return 'An unknown error occurred.';
+}
+
+function formatCauseChain(cause: any) {
+  const parts: string[] = [];
+  const seen = new Set();
+  while (cause && !seen.has(cause)) {
+    seen.add(cause);
+    if (cause?.message) {
+      parts.push(`caused by ${cause.name && cause.name !== 'Error' ? `${cause.name}: ` : ''}${cause.message}`);
+    } else {
+      parts.push(`caused by ${String(cause)}`);
+    }
+    cause = cause?.cause;
+  }
+  return parts;
 }
 
 async function parseFetchResponse(response: any) {
