@@ -310,14 +310,13 @@ function patchAuthTransportClass(TransportClass: any) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), AUTH_FETCH_TIMEOUT_MS);
         (timer as any).unref?.();
-        const useAxiosAdapter = shouldUseAxiosFetchAdapter(url);
-        traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} start${useAxiosAdapter ? ' (axios adapter)' : ''}`);
+        const adapterMode = authFetchAdapterMode();
+        traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} start${adapterMode === 'fetch' ? '' : ` (${adapterMode} adapter)`}`);
         try {
-          const effectiveFetch = useAxiosAdapter ? axiosFetchAdapter : originalFetchClient;
-          const response = await effectiveFetch(input as any, {
+          const response = await sendWithAuthFetchAdapter(originalFetchClient, input as any, {
             ...init,
             signal: init?.signal ?? controller.signal
-          });
+          }, url);
           traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} -> ${response.status} in ${Date.now() - fetchStarted}ms`);
           return response;
         } catch (error) {
@@ -342,15 +341,34 @@ function patchAuthTransportClass(TransportClass: any) {
   prototype.__carsTransportTracePatch = true;
 }
 
-function shouldUseAxiosFetchAdapter(url: URL): boolean {
-  const mode = (process.env.CARS_AUTH_FETCH_ADAPTER || 'axios').toLowerCase();
-  if (mode === 'fetch' || mode === 'native' || mode === 'none') return false;
-  if (mode === 'axios' || mode === '1' || mode === 'true') return true;
-  if (mode === 'storage') {
-    return [DEFAULT_MAINNET_STORAGE_URL, DEFAULT_TESTNET_STORAGE_URL]
-      .some(storageUrl => url.origin === new URL(storageUrl).origin);
+type AuthFetchAdapterMode = 'auto' | 'axios' | 'curl' | 'fetch';
+
+function authFetchAdapterMode(): AuthFetchAdapterMode {
+  const mode = (process.env.CARS_AUTH_FETCH_ADAPTER || 'curl').toLowerCase();
+  if (mode === 'fetch' || mode === 'native' || mode === 'none') return 'fetch';
+  if (mode === 'curl') return 'curl';
+  if (mode === 'axios' || mode === '1' || mode === 'true') return 'axios';
+  return 'auto';
+}
+
+async function sendWithAuthFetchAdapter(
+  originalFetchClient: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
+  input: RequestInfo | URL,
+  init: RequestInit,
+  url: URL
+): Promise<Response> {
+  const mode = authFetchAdapterMode();
+  if (mode === 'fetch') return await originalFetchClient(input, init);
+  if (mode === 'curl') return await curlFetchAdapter(input, init);
+  if (mode === 'axios') return await axiosFetchAdapter(input, init);
+
+  try {
+    return await axiosFetchAdapter(input, init);
+  } catch (error) {
+    if (!isRetryableError(error)) throw error;
+    traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${url.origin}${url.pathname} axios adapter failed; retrying with curl adapter: ${formatError(error)}`);
+    return await curlFetchAdapter(input, init);
   }
-  return true;
 }
 
 async function axiosFetchAdapter(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -379,16 +397,99 @@ async function axiosFetchAdapter(input: RequestInfo | URL, init?: RequestInit): 
     ? Buffer.from(response.data)
     : Buffer.from(response.data as any);
 
-  return {
-    ok: response.status >= 200 && response.status < 300,
+  return makeFetchResponse({
+    url,
     status: response.status,
     statusText: response.statusText,
+    headers: response.headers,
+    body
+  });
+}
+
+async function curlFetchAdapter(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const url = typeof input === 'string' || input instanceof URL
+    ? String(input)
+    : input.url;
+  const inputMethod = typeof input === 'object' && 'method' in input ? input.method : undefined;
+  const inputHeaders = typeof input === 'object' && 'headers' in input ? input.headers : undefined;
+  const inputBody = typeof input === 'object' && 'body' in input ? input.body : undefined;
+  const method = init?.method ?? inputMethod ?? 'GET';
+  const headers = headersToRecord(init?.headers ?? inputHeaders);
+  const data = init?.body ?? inputBody;
+  const tempDir = fs.mkdtempSync(path.join(process.cwd(), '.cars-curl-'));
+  const headerPath = path.join(tempDir, 'headers');
+  const bodyPath = path.join(tempDir, 'body');
+
+  try {
+    const args = [
+      '--silent',
+      '--show-error',
+      '--location',
+      '--max-time', String(Math.ceil(AUTH_FETCH_TIMEOUT_MS / 1000)),
+      '--request', String(method),
+      '--dump-header', headerPath,
+      '--output', bodyPath,
+      '--write-out', '%{http_code}',
+      url
+    ];
+
+    for (const [key, value] of Object.entries(headers)) {
+      args.push('--header', `${key}: ${value}`);
+    }
+
+    let inputData: Buffer | string | undefined;
+    if (data != null) {
+      args.push('--data-binary', '@-');
+      inputData = bodyToCurlInput(data);
+    }
+
+    const result = spawnSync('curl', args, {
+      input: inputData,
+      encoding: inputData == null || Buffer.isBuffer(inputData) ? 'buffer' : 'utf8',
+      maxBuffer: 25 * 1024 * 1024
+    });
+
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      const stderr = Buffer.isBuffer(result.stderr) ? result.stderr.toString('utf8') : String(result.stderr || '');
+      throw new Error(`curl exited ${result.status}${stderr ? `: ${stderr.trim()}` : ''}`);
+    }
+
+    const statusText = Buffer.isBuffer(result.stdout) ? result.stdout.toString('utf8') : String(result.stdout || '');
+    const status = parseInt(statusText.trim().slice(-3), 10);
+    const body = fs.existsSync(bodyPath) ? fs.readFileSync(bodyPath) : Buffer.alloc(0);
+    const rawHeaders = fs.existsSync(headerPath) ? fs.readFileSync(headerPath, 'utf8') : '';
+
+    return makeFetchResponse({
+      url,
+      status: Number.isFinite(status) ? status : 0,
+      statusText: '',
+      headers: parseCurlHeaders(rawHeaders),
+      body
+    });
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function makeFetchResponse(details: {
+  url: string;
+  status: number;
+  statusText: string;
+  headers: any;
+  body: Buffer;
+}): Response {
+  const { url, status, statusText, headers, body } = details;
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText,
     url,
     redirected: false,
     type: 'basic',
-    headers: new AxiosFetchHeaders(response.headers),
+    headers: new AdapterFetchHeaders(headers),
     clone: () => {
-      throw new Error('CARS axios fetch adapter response clone is not implemented');
+      throw new Error('CARS fetch adapter response clone is not implemented');
     },
     arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
     blob: async () => new Blob([body]),
@@ -402,6 +503,26 @@ async function axiosFetchAdapter(input: RequestInfo | URL, init?: RequestInit): 
   } as unknown as Response;
 }
 
+function bodyToCurlInput(body: BodyInit): Buffer | string {
+  if (typeof body === 'string') return body;
+  if (Buffer.isBuffer(body)) return body;
+  if (body instanceof ArrayBuffer) return Buffer.from(body);
+  if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+  return String(body);
+}
+
+function parseCurlHeaders(rawHeaders: string): Record<string, string> {
+  const blocks = rawHeaders.trim().split(/\r?\n\r?\n/).filter(Boolean);
+  const lastBlock = blocks[blocks.length - 1] || '';
+  const headers: Record<string, string> = {};
+  for (const line of lastBlock.split(/\r?\n/).slice(1)) {
+    const separator = line.indexOf(':');
+    if (separator <= 0) continue;
+    headers[line.slice(0, separator).trim().toLowerCase()] = line.slice(separator + 1).trim();
+  }
+  return headers;
+}
+
 function headersToRecord(headers: HeadersInit | undefined): Record<string, string> {
   if (headers == null) return {};
   if (headers instanceof Headers) return Object.fromEntries(headers.entries());
@@ -409,7 +530,7 @@ function headersToRecord(headers: HeadersInit | undefined): Record<string, strin
   return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, String(value)]));
 }
 
-class AxiosFetchHeaders {
+class AdapterFetchHeaders {
   constructor(private readonly headers: any) {}
 
   get(name: string): string | null {
