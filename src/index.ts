@@ -9,6 +9,7 @@ import { spawnSync } from 'child_process';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { AuthFetch, HexString, KeyDeriver, PrivateKey, WalletClient, WalletInterface, WalletNetwork } from '@bsv/sdk';
+import { createNonce, Peer } from '@bsv/sdk/auth';
 import ora from 'ora';
 import Table from 'cli-table3';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -20,6 +21,8 @@ global.self = { crypto } as any
 
 const isWindows = process.platform === 'win32'
 const npmCmd = isWindows ? 'npm.cmd' : 'npm'
+
+installAuthHandshakeRacePatch()
 
 // Create a Wallet Client and AuthFetch
 let walletClient: WalletInterface = new WalletClient('auto', 'localhost')
@@ -109,6 +112,60 @@ function normalizePrivateKey(key: HexString): HexString {
     throw new CARSRequestError('CARS private key must be a 64-character hex string. Keep the existing key material, but repair the repository secret formatting without rotating it.');
   }
   return trimmed.toLowerCase() as HexString;
+}
+
+function installAuthHandshakeRacePatch() {
+  const prototype = Peer.prototype as any;
+  if (prototype.__carsInitialResponseRacePatch) return;
+
+  const waitForInitialResponse = async function (this: any, sessionNonce: string): Promise<string> {
+    return await new Promise((resolve, reject) => {
+      let callbackID: number;
+      const timer = setTimeout(() => {
+        this.stopListeningForInitialResponses(callbackID);
+        reject(new Error(`Timed out waiting for initial auth response for session ${sessionNonce}`));
+      }, 30000);
+      (timer as any).unref?.();
+
+      callbackID = this.listenForInitialResponse(sessionNonce, (nonce: string) => {
+        clearTimeout(timer);
+        this.stopListeningForInitialResponses(callbackID);
+        resolve(nonce);
+      });
+    });
+  };
+
+  prototype.initiateHandshake = async function (identityKey?: string): Promise<string> {
+    const sessionNonce = await createNonce(this.wallet, undefined, this.originator);
+    const now = Date.now();
+    const certificatesRequired = this.certificatesToRequest.certifiers.length > 0;
+
+    await this.sessionManager.addSession({
+      isAuthenticated: false,
+      sessionNonce,
+      peerIdentityKey: identityKey,
+      lastUpdate: now,
+      certificatesRequired,
+      certificatesValidated: !certificatesRequired
+    });
+
+    const initialResponse = waitForInitialResponse.call(this, sessionNonce);
+    try {
+      await this.transport.send({
+        version: '0.1',
+        messageType: 'initialRequest',
+        identityKey: await this.getIdentityPublicKey(),
+        initialNonce: sessionNonce,
+        requestedCertificates: this.certificatesToRequest
+      });
+    } catch (error) {
+      initialResponse.catch(() => {});
+      throw error;
+    }
+    return await initialResponse;
+  };
+
+  prototype.__carsInitialResponseRacePatch = true;
 }
 
 /**
