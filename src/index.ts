@@ -40,6 +40,7 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
     authFetch = new AuthFetch(walletClient);
   }, {
     attempts: WALLET_STORAGE_RETRIES,
+    timeoutMs: REQUEST_TIMEOUT_MS,
     retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
   });
 }
@@ -185,12 +186,13 @@ async function retryOperation<T>(
   retryOptions: RetryOptions = {}
 ): Promise<T> {
   const attempts = retryOptions.attempts || REQUEST_RETRIES;
+  const timeoutMs = retryOptions.timeoutMs;
   const retryDelayMs = retryOptions.retryDelayMs || 2000;
   let lastError: any;
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      return await operation();
+      return await runWithTimeout(operation(), timeoutMs, `${label} timed out after ${timeoutMs}ms`);
     } catch (error: any) {
       lastError = error;
       if (attempt >= attempts || !isRetryableError(error)) break;
@@ -200,6 +202,19 @@ async function retryOperation<T>(
   }
 
   throw lastError;
+}
+
+function runWithTimeout<T>(promise: Promise<T>, timeoutMs: number | undefined, timeoutMessage: string): Promise<T> {
+  if (!timeoutMs) return promise;
+
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new CARSRequestError(timeoutMessage, { retryable: true }));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 function normalizeBaseUrl(rawUrl: string): string {
@@ -258,9 +273,12 @@ async function authFetchJson<T = any>(
 
   for (let attempt = 1; attempt <= attempts; attempt++) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await client.fetch(url, { ...init, signal: controller.signal });
+      const response = await runWithTimeout(
+        client.fetch(url, { ...init, signal: controller.signal }),
+        timeoutMs,
+        `${contextMsg} timed out after ${timeoutMs}ms`
+      );
       const body = await parseFetchResponse(response);
       if (!response.ok) {
         throw new CARSRequestError(`${contextMsg} failed`, {
@@ -279,7 +297,7 @@ async function authFetchJson<T = any>(
       console.error(chalk.yellow(`Transient CARS request failure (${attempt}/${attempts}) for ${url}: ${formatError(lastError)}`));
       await sleep(retryDelayMs * attempt);
     } finally {
-      clearTimeout(timer);
+      controller.abort();
     }
   }
 
