@@ -310,9 +310,11 @@ function patchAuthTransportClass(TransportClass: any) {
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), AUTH_FETCH_TIMEOUT_MS);
         (timer as any).unref?.();
-        traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} start`);
+        const useAxiosAdapter = shouldUseAxiosFetchAdapter(url);
+        traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} start${useAxiosAdapter ? ' (axios adapter)' : ''}`);
         try {
-          const response = await originalFetchClient(input as any, {
+          const effectiveFetch = useAxiosAdapter ? axiosFetchAdapter : originalFetchClient;
+          const response = await effectiveFetch(input as any, {
             ...init,
             signal: init?.signal ?? controller.signal
           });
@@ -338,6 +340,93 @@ function patchAuthTransportClass(TransportClass: any) {
   };
 
   prototype.__carsTransportTracePatch = true;
+}
+
+function shouldUseAxiosFetchAdapter(url: URL): boolean {
+  const mode = (process.env.CARS_AUTH_FETCH_ADAPTER || 'axios').toLowerCase();
+  if (mode === 'fetch' || mode === 'native' || mode === 'none') return false;
+  if (mode === 'axios' || mode === '1' || mode === 'true') return true;
+  if (mode === 'storage') {
+    return [DEFAULT_MAINNET_STORAGE_URL, DEFAULT_TESTNET_STORAGE_URL]
+      .some(storageUrl => url.origin === new URL(storageUrl).origin);
+  }
+  return true;
+}
+
+async function axiosFetchAdapter(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const url = typeof input === 'string' || input instanceof URL
+    ? String(input)
+    : input.url;
+  const inputMethod = typeof input === 'object' && 'method' in input ? input.method : undefined;
+  const inputHeaders = typeof input === 'object' && 'headers' in input ? input.headers : undefined;
+  const inputBody = typeof input === 'object' && 'body' in input ? input.body : undefined;
+  const method = init?.method ?? inputMethod ?? 'GET';
+  const headers = headersToRecord(init?.headers ?? inputHeaders);
+  const data = init?.body ?? inputBody;
+
+  const response = await axios.request<ArrayBuffer>({
+    method: method as any,
+    url,
+    headers,
+    data,
+    responseType: 'arraybuffer',
+    timeout: AUTH_FETCH_TIMEOUT_MS,
+    signal: init?.signal,
+    validateStatus: () => true
+  });
+
+  const body = response.data instanceof ArrayBuffer
+    ? Buffer.from(response.data)
+    : Buffer.from(response.data as any);
+
+  return {
+    ok: response.status >= 200 && response.status < 300,
+    status: response.status,
+    statusText: response.statusText,
+    url,
+    redirected: false,
+    type: 'basic',
+    headers: new AxiosFetchHeaders(response.headers),
+    clone: () => {
+      throw new Error('CARS axios fetch adapter response clone is not implemented');
+    },
+    arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+    blob: async () => new Blob([body]),
+    formData: async () => {
+      throw new Error('CARS axios fetch adapter response formData is not implemented');
+    },
+    json: async () => JSON.parse(body.toString('utf8')),
+    text: async () => body.toString('utf8'),
+    body: null,
+    bodyUsed: false
+  } as unknown as Response;
+}
+
+function headersToRecord(headers: HeadersInit | undefined): Record<string, string> {
+  if (headers == null) return {};
+  if (headers instanceof Headers) return Object.fromEntries(headers.entries());
+  if (Array.isArray(headers)) return Object.fromEntries(headers.map(([key, value]) => [key, value]));
+  return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, String(value)]));
+}
+
+class AxiosFetchHeaders {
+  constructor(private readonly headers: any) {}
+
+  get(name: string): string | null {
+    const value = this.headers?.[name.toLowerCase()] ?? this.headers?.[name];
+    if (Array.isArray(value)) return value.join(', ');
+    return value == null ? null : String(value);
+  }
+
+  has(name: string): boolean {
+    return this.get(name) != null;
+  }
+
+  forEach(callback: (value: string, key: string) => void) {
+    for (const [key, value] of Object.entries(this.headers || {})) {
+      callback(Array.isArray(value) ? value.join(', ') : String(value), key);
+    }
+  }
 }
 
 function walletSetupTraceEnabled(): boolean {
