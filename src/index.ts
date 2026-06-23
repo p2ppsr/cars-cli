@@ -292,14 +292,43 @@ function patchAuthTransportClass(TransportClass: any) {
   prototype.send = async function (message: any): Promise<void> {
     const messageType = typeof message?.messageType === 'string' ? message.messageType : 'unknown';
     const baseUrl = typeof this.baseUrl === 'string' ? this.baseUrl : 'unknown';
+    const originalFetchClient = typeof this.fetchClient === 'function' ? this.fetchClient.bind(this) : undefined;
     const started = Date.now();
     traceWalletSetupMessage(`SimplifiedFetchTransport.send ${messageType} ${baseUrl} start`);
+    if (originalFetchClient != null) {
+      this.fetchClient = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = typeof input === 'string' || input instanceof URL
+          ? new URL(input)
+          : new URL(input.url);
+        const method = init?.method ?? (typeof input === 'object' && 'method' in input ? input.method : 'GET');
+        const fetchStarted = Date.now();
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), AUTH_FETCH_TIMEOUT_MS);
+        (timer as any).unref?.();
+        traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} start`);
+        try {
+          const response = await originalFetchClient(input as any, {
+            ...init,
+            signal: init?.signal ?? controller.signal
+          });
+          traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} -> ${response.status} in ${Date.now() - fetchStarted}ms`);
+          return response;
+        } catch (error) {
+          traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} failed in ${Date.now() - fetchStarted}ms: ${formatError(error)}`);
+          throw error;
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+    }
     try {
       await originalSend.call(this, message);
       traceWalletSetupMessage(`SimplifiedFetchTransport.send ${messageType} ${baseUrl} ok in ${Date.now() - started}ms`);
     } catch (error) {
       traceWalletSetupMessage(`SimplifiedFetchTransport.send ${messageType} ${baseUrl} failed in ${Date.now() - started}ms: ${formatError(error)}`);
       throw error;
+    } finally {
+      if (originalFetchClient != null) this.fetchClient = originalFetchClient;
     }
   };
 
@@ -416,6 +445,7 @@ const REQUEST_TIMEOUT_MS = parsePositiveInt(process.env.CARS_REQUEST_TIMEOUT_MS,
 const CONNECT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_CONNECT_TIMEOUT_MS, REQUEST_TIMEOUT_MS);
 const PREFLIGHT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_PREFLIGHT_TIMEOUT_MS, 15000);
 const WALLET_STORAGE_TIMEOUT_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_TIMEOUT_MS, Math.min(REQUEST_TIMEOUT_MS, 120000));
+const AUTH_FETCH_TIMEOUT_MS = parsePositiveInt(process.env.CARS_AUTH_FETCH_TIMEOUT_MS, Math.min(REQUEST_TIMEOUT_MS, 30000));
 const RELEASE_UPLOAD_TIMEOUT_MS = parsePositiveInt(process.env.CARS_UPLOAD_TIMEOUT_MS, 15 * 60 * 1000);
 const REQUEST_RETRIES = parsePositiveInt(process.env.CARS_REQUEST_RETRIES, 3);
 const WALLET_STORAGE_RETRY_DELAY_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_RETRY_DELAY_MS, 3000);
