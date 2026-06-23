@@ -248,6 +248,7 @@ cars global-info
 - **`cars project webui-config:delete <key> [nameOrIndex]`** : Delete a config key.  
 - **`cars project billing-stats [nameOrIndex]`** : View billing stats, with `--start`, `--end`, `--type`.  
 - **`cars project topup [nameOrIndex]`** : Top up project balance, optional `--amount`.  
+- **`cars project ensure-balance [nameOrIndex] --min <sats> [--topup-to <sats>]`** : Non-interactive CI/CD balance guard. Fails when the project is below `--min`, or tops up through CARS accounting to `--topup-to` before continuing.
 - **`cars project delete [nameOrIndex]`** : Delete project (confirmation required, or use `--force`).
 
 **Release Management**  
@@ -255,7 +256,7 @@ cars global-info
 - **`cars release get-upload-url [nameOrIndex]`** : Create a new release and get upload URL.  
 - **`cars release upload-files <uploadURL> <artifactPath>`** : Upload artifact.  
 - **`cars release logs [releaseId] [nameOrIndex]`** : View release logs; if no `releaseId`, prompts for one.  
-- **`cars release now [nameOrIndex]`** : Create and immediately upload the latest artifact.
+- **`cars release now [nameOrIndex]`** : Create and immediately upload the latest artifact. The command checks project balance before creating the deployment record.
 
 **Artifact Management**  
 - **`cars artifact`** : Interactive artifact menu.  

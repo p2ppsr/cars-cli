@@ -1918,9 +1918,7 @@ async function showProjectInfo(config: CARSConfig) {
     console.error(chalk.red('❌ No project ID set.'));
     return;
   }
-  const client = await buildAuthFetch(config);
-  const info = await safeRequest<ProjectInfo>(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/info`, {});
-  if (!info) return;
+  const info = await getProjectInfo(config);
 
   console.log(chalk.magentaBright(`\nProject "${info.name}" (ID: ${info.id}) Info:`));
   const table = new Table();
@@ -1956,6 +1954,63 @@ async function showProjectInfo(config: CARSConfig) {
       await topUpProjectBalance(config);
     }
   }
+}
+
+async function getProjectInfo(config: CARSConfig): Promise<ProjectInfo> {
+  if (!config.projectID) {
+    throw new Error('No project ID set.');
+  }
+  const client = await buildAuthFetch(config);
+  return await requiredRequest<ProjectInfo>(client, config.CARSCloudURL, `/api/v1/project/${config.projectID}/info`, {}, 'Project info');
+}
+
+async function assertProjectBalanceAtLeast(config: CARSConfig, minBalance: number): Promise<ProjectInfo> {
+  const info = await getProjectInfo(config);
+  const balance = Number(info.billing?.balance ?? 0);
+  if (balance < minBalance) {
+    throw new Error(`Project ${info.id} balance is ${balance} sats; at least ${minBalance} sats are required. Run \`cars project ensure-balance --min ${minBalance} --topup-to <target>\` or \`cars project topup --amount <sats>\`.`);
+  }
+  return info;
+}
+
+async function ensureProjectBalance(config: CARSConfig, minBalance: number, topUpTo?: number) {
+  if (minBalance < 1) {
+    throw new Error('--min must be at least 1 satoshi.');
+  }
+  if (topUpTo !== undefined && topUpTo < minBalance) {
+    throw new Error('--topup-to must be greater than or equal to --min.');
+  }
+
+  let info = await getProjectInfo(config);
+  let balance = Number(info.billing?.balance ?? 0);
+  console.log(`CARS project balance: ${balance} sats`);
+
+  if (balance >= minBalance) {
+    console.log(chalk.green(`✅ Project balance is at least ${minBalance} sats.`));
+    console.log(`CARS_BALANCE_READY balance=${balance}`);
+    return;
+  }
+
+  if (topUpTo === undefined) {
+    throw new Error(`Project ${info.id} balance is ${balance} sats; at least ${minBalance} sats are required.`);
+  }
+
+  const topUpAmount = topUpTo - balance;
+  if (topUpAmount <= 0) {
+    throw new Error(`Project ${info.id} balance is ${balance} sats and cannot be raised to ${topUpTo} sats.`);
+  }
+
+  console.log(chalk.yellow(`Project balance is below ${minBalance} sats; topping up ${topUpAmount} sats to target ${topUpTo}.`));
+  await topUpProjectBalanceByAmount(config, topUpAmount);
+
+  info = await getProjectInfo(config);
+  balance = Number(info.billing?.balance ?? 0);
+  if (balance < minBalance) {
+    throw new Error(`Project ${info.id} balance is still ${balance} sats after top-up; at least ${minBalance} sats are required.`);
+  }
+
+  console.log(chalk.green(`✅ Project balance is now ${balance} sats.`));
+  console.log(`CARS_BALANCE_READY balance=${balance}`);
 }
 
 /**
@@ -3014,6 +3069,7 @@ async function releaseLatestArtifact(config: CARSConfig): Promise<CarsUploadResu
   if (!config.projectID) {
     throw new Error('No project ID set.');
   }
+  await assertProjectBalanceAtLeast(config, 1);
   const artifactPath = findLatestArtifact();
   const client = await buildAuthFetch(config);
   const result = await requiredRequest<{ url?: string; deploymentId?: string; data?: any }>(
@@ -3543,6 +3599,37 @@ projectCommand
     }
 
     await topUpProjectBalanceByAmount(cfg, amount);
+  });
+
+// Ensure balance for CI/CD
+projectCommand
+  .command('ensure-balance [nameOrIndex]')
+  .option('--key <key>', 'Private key to use with CARS')
+  .option('--network <network>', 'Network to use with CARS')
+  .option('--storage <storage>', 'Wallet storage to use with CARS')
+  .requiredOption('--min <sats>', 'Minimum balance required in satoshis')
+  .option('--topup-to <sats>', 'Top up to this balance when current balance is below --min')
+  .description('Fail unless the project has enough balance, optionally topping up non-interactively')
+  .action(async (nameOrIndex, options) => {
+    if (options.key) {
+      await remakeWallet(options.key, options.network, options.storage)
+    }
+    const info = loadCARSConfigInfo();
+    const cfg = await pickCARSConfig(info, nameOrIndex);
+
+    if (!cfg.projectID) {
+      console.error(chalk.red('❌ No project ID set.'));
+      process.exit(1);
+    }
+
+    const minBalance = parsePositiveInt(options.min, 0);
+    const topUpTo = options.topupTo ? parsePositiveInt(options.topupTo, 0) : undefined;
+    try {
+      await ensureProjectBalance(cfg, minBalance, topUpTo);
+    } catch (error) {
+      handleRequestError(error, 'Project balance check failed');
+      process.exit(1);
+    }
   });
 
 // Delete project
