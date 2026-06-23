@@ -9,7 +9,7 @@ import { spawnSync } from 'child_process';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { AuthFetch, HexString, KeyDeriver, PrivateKey, WalletClient, WalletInterface, WalletNetwork } from '@bsv/sdk';
-import { createNonce, Peer } from '@bsv/sdk/auth';
+import { Peer } from '@bsv/sdk/auth';
 import ora from 'ora';
 import Table from 'cli-table3';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -136,7 +136,7 @@ function installAuthHandshakeRacePatch() {
   };
 
   prototype.initiateHandshake = async function (identityKey?: string): Promise<string> {
-    const sessionNonce = await createNonce(this.wallet, undefined, this.originator);
+    const sessionNonce = await createPrintableNonce(this.wallet, this.originator);
     const now = Date.now();
     const certificatesRequired = this.certificatesToRequest.certifiers.length > 0;
 
@@ -166,6 +166,18 @@ function installAuthHandshakeRacePatch() {
   };
 
   prototype.__carsInitialResponseRacePatch = true;
+}
+
+async function createPrintableNonce(wallet: WalletInterface, originator?: string): Promise<string> {
+  const firstHalf = Array.from(crypto.randomBytes(16), value => 33 + (value % 94));
+  const keyID = Buffer.from(firstHalf).toString('utf8');
+  const { hmac } = await wallet.createHmac({
+    protocolID: [2, 'server hmac'],
+    keyID,
+    data: firstHalf,
+    counterparty: 'self'
+  }, originator);
+  return Buffer.from([...firstHalf, ...hmac]).toString('base64');
 }
 
 /**
