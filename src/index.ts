@@ -65,6 +65,19 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
       retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
     });
 
+    await retryOperation('Wallet HMAC check', async () => {
+      await wallet.createHmac({
+        data: [0],
+        protocolID: [2, 'server hmac'],
+        keyID: 'preflight',
+        counterparty: 'self'
+      });
+    }, {
+      attempts: 1,
+      timeoutMs: WALLET_STORAGE_TIMEOUT_MS,
+      retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
+    });
+
     await retryOperation('Wallet storage provider registration', async () => {
       const client = new StorageClient(wallet, storageUrl);
       console.log(chalk.cyan('Registering CARS wallet storage provider...'));
