@@ -1,6 +1,6 @@
 {
     "name": "@p2ppsr/cars-cli",
-    "version": "1.2.13",
+    "version": "1.2.14",
     "main": "dist/index.js",
     "type": "module",
     "repository": {
@@ -22,8 +22,8 @@
         "build": "tsc"
     },
     "dependencies": {
-        "@bsv/sdk": "^2.0.1",
-        "@bsv/wallet-toolbox-client": "^2.0.5",
+        "@bsv/sdk": "^2.1.6",
+        "@bsv/wallet-toolbox-client": "^2.2.0",
         "axios": "^1.4.0",
         "chalk": "^4.1.2",
         "cli-table3": "^0.6.5",

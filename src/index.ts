@@ -25,20 +25,23 @@ let walletClient: WalletInterface = new WalletClient('auto', 'localhost')
 let authFetch = new AuthFetch(walletClient);
 
 const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', storage?: string) => {
-  if (typeof storage !== 'string') {
-    storage = defaultStorageUrl(network);
-  }
-  const keyDeriver = new KeyDeriver(new PrivateKey(key, 'hex'));
-  const storageManager = new WalletStorageManager(keyDeriver.identityKey);
-  const chain = network === 'mainnet' ? 'main' : 'test'
-  const signer = new WalletSigner(chain, keyDeriver, storageManager);
-  const services = new Services(chain);
-  const wallet = new Wallet(signer, services);
-  const client = new StorageClient(wallet, storage);
-  await client.makeAvailable();
-  await storageManager.addWalletStorageProvider(client);
-  walletClient = wallet;
-  authFetch = new AuthFetch(walletClient);
+  const storageUrl = typeof storage === 'string' ? storage : defaultStorageUrl(network);
+  await retryOperation('Wallet storage initialization', async () => {
+    const keyDeriver = new KeyDeriver(new PrivateKey(key, 'hex'));
+    const storageManager = new WalletStorageManager(keyDeriver.identityKey);
+    const chain = network === 'mainnet' ? 'main' : 'test'
+    const signer = new WalletSigner(chain, keyDeriver, storageManager);
+    const services = new Services(chain);
+    const wallet = new Wallet(signer, services);
+    const client = new StorageClient(wallet, storageUrl);
+    await client.makeAvailable();
+    await storageManager.addWalletStorageProvider(client);
+    walletClient = wallet;
+    authFetch = new AuthFetch(walletClient);
+  }, {
+    attempts: WALLET_STORAGE_RETRIES,
+    retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
+  });
 }
 
 /**
@@ -130,6 +133,8 @@ const REQUEST_TIMEOUT_MS = parsePositiveInt(process.env.CARS_REQUEST_TIMEOUT_MS,
 const PREFLIGHT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_PREFLIGHT_TIMEOUT_MS, 15000);
 const RELEASE_UPLOAD_TIMEOUT_MS = parsePositiveInt(process.env.CARS_UPLOAD_TIMEOUT_MS, 15 * 60 * 1000);
 const REQUEST_RETRIES = parsePositiveInt(process.env.CARS_REQUEST_RETRIES, 3);
+const WALLET_STORAGE_RETRIES = parsePositiveInt(process.env.CARS_WALLET_STORAGE_RETRIES, REQUEST_RETRIES);
+const WALLET_STORAGE_RETRY_DELAY_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_RETRY_DELAY_MS, 3000);
 const UPLOAD_RETRIES = parsePositiveInt(process.env.CARS_UPLOAD_RETRIES, 3);
 const TOPUP_CHUNK_SATS = parsePositiveInt(process.env.CARS_TOPUP_CHUNK_SATS, 10000);
 
@@ -172,6 +177,29 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
 
 function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function retryOperation<T>(
+  label: string,
+  operation: () => Promise<T>,
+  retryOptions: RetryOptions = {}
+): Promise<T> {
+  const attempts = retryOptions.attempts || REQUEST_RETRIES;
+  const retryDelayMs = retryOptions.retryDelayMs || 2000;
+  let lastError: any;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await operation();
+    } catch (error: any) {
+      lastError = error;
+      if (attempt >= attempts || !isRetryableError(error)) break;
+      console.error(chalk.yellow(`${label} failed transiently (${attempt}/${attempts}): ${formatError(error)}`));
+      await sleep(retryDelayMs * attempt);
+    }
+  }
+
+  throw lastError;
 }
 
 function normalizeBaseUrl(rawUrl: string): string {
@@ -3081,6 +3109,7 @@ releaseCommand
     }
 
     try {
+      await runCARSPreflight(cfg, undefined, options.storage);
       await releaseLatestArtifact(cfg);
     } catch (error) {
       handleRequestError(error, 'Release failed');
