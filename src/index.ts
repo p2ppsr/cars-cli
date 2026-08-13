@@ -661,7 +661,6 @@ const CONNECT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_CONNECT_TIMEOUT_MS,
 const PREFLIGHT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_PREFLIGHT_TIMEOUT_MS, 15000);
 const WALLET_STORAGE_TIMEOUT_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_TIMEOUT_MS, Math.min(REQUEST_TIMEOUT_MS, 120000));
 const AUTH_FETCH_TIMEOUT_MS = parsePositiveInt(process.env.CARS_AUTH_FETCH_TIMEOUT_MS, Math.min(REQUEST_TIMEOUT_MS, 20000));
-const RELEASE_UPLOAD_TIMEOUT_MS = parsePositiveInt(process.env.CARS_UPLOAD_TIMEOUT_MS, 15 * 60 * 1000);
 const REQUEST_RETRIES = parsePositiveInt(process.env.CARS_REQUEST_RETRIES, 3);
 const WALLET_STORAGE_ATTEMPTS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_ATTEMPTS, 3);
 const WALLET_STORAGE_RETRY_DELAY_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_RETRY_DELAY_MS, 3000);
@@ -3101,7 +3100,10 @@ async function uploadArtifact(uploadURL: string, artifactPath: string): Promise<
         },
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
-        timeout: RELEASE_UPLOAD_TIMEOUT_MS,
+        // Artifact size and uplink speed determine how long a valid upload
+        // takes. The CARS service owns the operator-side upload policy; the
+        // client must not impose a second whole-upload deadline.
+        timeout: 0,
         validateStatus: status => status >= 200 && status < 300
       });
       spinner.succeed(`✅ Artifact uploaded successfully (${artifactSize} bytes).`);
