@@ -634,7 +634,11 @@ interface AdminInfo {
 
 interface DeployInfo {
   deployment_uuid: string;
+  status: 'pending' | 'uploading' | 'processing' | 'succeeded' | 'failed' | 'expired';
+  error_message?: string | null;
   created_at: string;
+  accepted_at?: string | null;
+  completed_at?: string | null;
 }
 
 interface AccountingRecord {
@@ -665,6 +669,8 @@ const REQUEST_RETRIES = parsePositiveInt(process.env.CARS_REQUEST_RETRIES, 3);
 const WALLET_STORAGE_ATTEMPTS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_ATTEMPTS, 3);
 const WALLET_STORAGE_RETRY_DELAY_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_RETRY_DELAY_MS, 3000);
 const UPLOAD_RETRIES = parsePositiveInt(process.env.CARS_UPLOAD_RETRIES, 3);
+const DEPLOYMENT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_DEPLOYMENT_TIMEOUT_MS, 2 * 60 * 60 * 1000);
+const DEPLOYMENT_POLL_INTERVAL_MS = parsePositiveInt(process.env.CARS_DEPLOYMENT_POLL_INTERVAL_MS, 5000);
 const TOPUP_CHUNK_SATS = parsePositiveInt(process.env.CARS_TOPUP_CHUNK_SATS, 10000);
 
 setGlobalDispatcher(new Agent({
@@ -3121,6 +3127,56 @@ async function uploadArtifact(uploadURL: string, artifactPath: string): Promise<
   throw lastError;
 }
 
+async function waitForDeploymentResult(
+  config: CARSConfig,
+  client: AuthFetch,
+  deploymentId: string,
+): Promise<DeployInfo> {
+  const spinner = ora(`Waiting for CARS deployment ${deploymentId}...`).start();
+  const deadline = Date.now() + DEPLOYMENT_TIMEOUT_MS;
+  const activeStatuses = new Set(['pending', 'uploading', 'processing']);
+
+  try {
+    while (Date.now() < deadline) {
+      const result = await requiredRequest<{ deploys: DeployInfo[] }>(
+        client,
+        config.CARSCloudURL,
+        `/api/v1/project/${config.projectID}/deploys/list`,
+        {},
+        `Check deployment ${deploymentId}`,
+      );
+      const deployment = result.deploys?.find(item => item.deployment_uuid === deploymentId);
+      if (!deployment) {
+        throw new CARSRequestError(`CARS did not return deployment ${deploymentId} after accepting its upload.`);
+      }
+      if (deployment.status === 'succeeded') {
+        spinner.succeed(`✅ CARS deployment completed successfully. Deployment ID: ${deploymentId}`);
+        return deployment;
+      }
+      if (deployment.status === 'failed' || deployment.status === 'expired') {
+        const detail = deployment.error_message?.trim() || `status ${deployment.status}`;
+        spinner.fail(`❌ CARS deployment ${deployment.status}. Deployment ID: ${deploymentId}`);
+        throw new CARSRequestError(`CARS deployment ${deploymentId} ${deployment.status}: ${detail}`, {
+          body: deployment,
+        });
+      }
+      if (!activeStatuses.has(deployment.status)) {
+        throw new CARSRequestError(`CARS deployment ${deploymentId} returned unexpected status ${String(deployment.status)}.`);
+      }
+      spinner.text = `CARS deployment ${deploymentId}: ${deployment.status}`;
+      await sleep(Math.min(DEPLOYMENT_POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
+    }
+    spinner.fail(`❌ Timed out waiting for CARS deployment ${deploymentId}.`);
+    throw new CARSRequestError(
+      `CARS deployment ${deploymentId} did not finish within ${DEPLOYMENT_TIMEOUT_MS}ms. Its server-side status remains authoritative.`,
+      { retryable: true },
+    );
+  } catch (error) {
+    if (spinner.isSpinning) spinner.fail(`❌ Unable to confirm CARS deployment ${deploymentId}.`);
+    throw error;
+  }
+}
+
 async function releaseLatestArtifact(config: CARSConfig): Promise<CarsUploadResult> {
   if (!config.projectID) {
     throw new Error('No project ID set.');
@@ -3142,9 +3198,10 @@ async function releaseLatestArtifact(config: CARSConfig): Promise<CarsUploadResu
 
   const upload = await uploadArtifact(deploy.url, artifactPath);
   const deploymentId = upload.deploymentId || deploy.deploymentId;
-  console.log(chalk.green(`✅ CARS release accepted. Deployment ID: ${deploymentId}`));
+  console.log(chalk.green(`✅ CARS release accepted for processing. Deployment ID: ${deploymentId}`));
+  const deployment = await waitForDeploymentResult(config, client, deploymentId);
   console.log(`CARS_RELEASE_SUCCESS deploymentId=${deploymentId}`);
-  return { ...upload, deploymentId };
+  return { ...upload, deploymentId, body: { ...upload.body, deployment } };
 }
 
 /**

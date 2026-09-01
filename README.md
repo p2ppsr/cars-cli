@@ -256,7 +256,7 @@ cars global-info
 - **`cars release get-upload-url [nameOrIndex]`** : Create a new release and get upload URL.  
 - **`cars release upload-files <uploadURL> <artifactPath>`** : Upload artifact.  
 - **`cars release logs [releaseId] [nameOrIndex]`** : View release logs; if no `releaseId`, prompts for one.  
-- **`cars release now [nameOrIndex]`** : Create and immediately upload the latest artifact. The command checks project balance before creating the deployment record. Artifact streaming has no fixed client-side total deadline; the CARS service owns the upload policy, while transport failures still fail and retry normally.
+- **`cars release now [nameOrIndex]`** : Create and immediately upload the latest artifact. The command checks project balance before creating the deployment record, then polls the authenticated server-side deployment record until it succeeds or fails. `CARS_RELEASE_SUCCESS` is printed only after a successful rollout. Artifact streaming has no fixed client-side total deadline; post-upload processing defaults to a two-hour bound configurable with `CARS_DEPLOYMENT_TIMEOUT_MS`, and its poll interval defaults to five seconds configurable with `CARS_DEPLOYMENT_POLL_INTERVAL_MS`.
 
 **Artifact Management**  
 - **`cars artifact`** : Interactive artifact menu.  
