@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20, 22, 24]
+        node-version: [22, 24]
     steps:
     - uses: actions/checkout@v6
     - uses: actions/setup-node@v6
@@ -25,7 +25,7 @@ jobs:
         node-version: ${{ matrix.node-version }}
         registry-url: 'https://registry.npmjs.org'
     - run: npm ci
-    - run: npm run build
+    - run: npm test
     - run: npm run lint:ci --if-present
     - run: npm run test:coverage --if-present
     - name: Upload coverage to Codecov

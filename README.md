@@ -276,3 +276,13 @@ cars global-info
 ## License
 
 [Open BSV License](./LICENSE.txt)
+
+## Authentication compatibility
+
+CARS CLI 1.2.34 requires SDK 2.8.2 and Wallet Toolbox Client 2.14.0 or newer.
+Authentication uses the SDK handshake and bounded native fetch transport directly.
+The obsolete prototype handshake workaround and curl/axios auth adapters have
+been removed: they relied on SDK internals and could bypass redirect and response
+size protections. `CARS_AUTH_FETCH_ADAPTER` and `CARS_AUTH_FETCH_TIMEOUT_MS` no
+longer override SDK authentication behavior. Existing outer command timeouts and
+balance reconciliation remain in effect.
