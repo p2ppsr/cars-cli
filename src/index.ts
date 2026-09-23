@@ -5,12 +5,11 @@ import path from 'path';
 import axios from 'axios';
 import * as tar from 'tar';
 import dns from 'dns/promises';
-import { createRequire } from 'module';
+import { pathToFileURL } from 'url';
 import { spawnSync } from 'child_process';
 import chalk from 'chalk';
 import inquirer from 'inquirer';
 import { AuthFetch, HexString, KeyDeriver, PrivateKey, WalletClient, WalletInterface, WalletNetwork } from '@bsv/sdk';
-import { Peer, SimplifiedFetchTransport } from '@bsv/sdk/auth';
 import ora from 'ora';
 import Table from 'cli-table3';
 import { Agent, setGlobalDispatcher } from 'undici';
@@ -19,12 +18,9 @@ import { Agent, setGlobalDispatcher } from 'undici';
 import * as crypto from 'crypto'
 import { PrivilegedKeyManager, Services, StorageClient, Wallet, WalletSigner, WalletStorageManager } from '@bsv/wallet-toolbox-client';
 global.self = { crypto } as any
-const requireCjs = createRequire(import.meta.url)
 
 const isWindows = process.platform === 'win32'
 const npmCmd = isWindows ? 'npm.cmd' : 'npm'
-
-installAuthHandshakeRacePatch()
 
 // Create a Wallet Client and AuthFetch
 let walletClient: WalletInterface = new WalletClient('auto', 'localhost')
@@ -97,8 +93,8 @@ const remakeWallet = async (key: HexString, network: WalletNetwork = 'mainnet', 
       }
       console.log(chalk.green('CARS wallet storage remote is available.'));
     }, {
-      // Each attempt uses a fresh StorageClient and the transport patch aborts
-      // stuck auth fetches, so retries do not reuse poisoned auth state.
+      // Each attempt uses a fresh StorageClient; the SDK owns bounded auth
+      // transport and handshake state. Never replace its security checks.
       attempts: WALLET_STORAGE_ATTEMPTS,
       timeoutMs: WALLET_STORAGE_TIMEOUT_MS,
       retryDelayMs: WALLET_STORAGE_RETRY_DELAY_MS
@@ -210,365 +206,8 @@ function installStorageFetchTrace(storageUrl: string): () => void {
   };
 }
 
-function installAuthHandshakeRacePatch() {
-  patchAuthClasses(Peer, SimplifiedFetchTransport);
-  try {
-    const cjsAuth = requireCjs('@bsv/sdk/auth');
-    patchAuthClasses(cjsAuth.Peer, cjsAuth.SimplifiedFetchTransport);
-  } catch (error) {
-    traceWalletSetupMessage(`Unable to patch CommonJS auth classes: ${formatError(error)}`);
-  }
-}
-
-function patchAuthClasses(PeerClass: any, TransportClass: any) {
-  patchAuthTransportClass(TransportClass);
-  patchPeerClass(PeerClass);
-}
-
-function patchPeerClass(PeerClass: any) {
-  const prototype = PeerClass?.prototype as any;
-  if (prototype == null) return;
-  if (prototype.__carsInitialResponseRacePatch) return;
-
-  const waitForInitialResponse = async function (this: any, sessionNonce: string): Promise<string> {
-    return await new Promise((resolve, reject) => {
-      let callbackID: number;
-      const initialResponseTimeoutMs = Math.max(AUTH_FETCH_TIMEOUT_MS + 10000, 30000);
-      const timer = setTimeout(() => {
-        this.stopListeningForInitialResponses(callbackID);
-        reject(new Error(`Timed out waiting for initial auth response for session ${sessionNonce}`));
-      }, initialResponseTimeoutMs);
-      (timer as any).unref?.();
-
-      callbackID = this.listenForInitialResponse(sessionNonce, (nonce: string) => {
-        clearTimeout(timer);
-        this.stopListeningForInitialResponses(callbackID);
-        resolve(nonce);
-      });
-    });
-  };
-
-  prototype.initiateHandshake = async function (identityKey?: string): Promise<string> {
-    traceWalletSetupMessage('Peer.initiateHandshake start');
-    const sessionNonce = await createPrintableNonce(this.wallet, this.originator);
-    traceWalletSetupMessage('Peer.initiateHandshake nonce ready');
-    const now = Date.now();
-    const certificatesRequired = this.certificatesToRequest.certifiers.length > 0;
-
-    await this.sessionManager.addSession({
-      isAuthenticated: false,
-      sessionNonce,
-      peerIdentityKey: identityKey,
-      lastUpdate: now,
-      certificatesRequired,
-      certificatesValidated: !certificatesRequired
-    });
-
-    const initialResponse = waitForInitialResponse.call(this, sessionNonce);
-    try {
-      traceWalletSetupMessage('Peer.initiateHandshake initialRequest send start');
-      await this.transport.send({
-        version: '0.1',
-        messageType: 'initialRequest',
-        identityKey: await this.getIdentityPublicKey(),
-        initialNonce: sessionNonce,
-        requestedCertificates: this.certificatesToRequest
-      });
-      traceWalletSetupMessage('Peer.initiateHandshake initialRequest send ok');
-    } catch (error) {
-      initialResponse.catch(() => {});
-      traceWalletSetupMessage(`Peer.initiateHandshake initialRequest send failed: ${formatError(error)}`);
-      throw error;
-    }
-    const responseNonce = await initialResponse;
-    traceWalletSetupMessage('Peer.initiateHandshake initialResponse received');
-    return responseNonce;
-  };
-
-  prototype.__carsInitialResponseRacePatch = true;
-}
-
-function patchAuthTransportClass(TransportClass: any) {
-  const prototype = TransportClass?.prototype as any;
-  if (prototype == null) return;
-  if (prototype.__carsTransportTracePatch) return;
-
-  const originalSend = prototype.send;
-  prototype.send = async function (message: any): Promise<void> {
-    const messageType = typeof message?.messageType === 'string' ? message.messageType : 'unknown';
-    const baseUrl = typeof this.baseUrl === 'string' ? this.baseUrl : 'unknown';
-    const originalFetchClient = typeof this.fetchClient === 'function' ? this.fetchClient.bind(this) : undefined;
-    const started = Date.now();
-    traceWalletSetupMessage(`SimplifiedFetchTransport.send ${messageType} ${baseUrl} start`);
-    if (originalFetchClient != null) {
-      this.fetchClient = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-        const url = typeof input === 'string' || input instanceof URL
-          ? new URL(input)
-          : new URL(input.url);
-        const method = init?.method ?? (typeof input === 'object' && 'method' in input ? input.method : 'GET');
-        const fetchStarted = Date.now();
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), AUTH_FETCH_TIMEOUT_MS);
-        (timer as any).unref?.();
-        const adapterMode = authFetchAdapterMode();
-        traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} start${adapterMode === 'fetch' ? '' : ` (${adapterMode} adapter)`}`);
-        try {
-          const response = await sendWithAuthFetchAdapter(originalFetchClient, input as any, {
-            ...init,
-            signal: init?.signal ?? controller.signal
-          }, url);
-          traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} -> ${response.status} in ${Date.now() - fetchStarted}ms`);
-          return response;
-        } catch (error) {
-          traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${method} ${url.origin}${url.pathname} failed in ${Date.now() - fetchStarted}ms: ${formatError(error)}`);
-          throw error;
-        } finally {
-          clearTimeout(timer);
-        }
-      };
-    }
-    try {
-      await originalSend.call(this, message);
-      traceWalletSetupMessage(`SimplifiedFetchTransport.send ${messageType} ${baseUrl} ok in ${Date.now() - started}ms`);
-    } catch (error) {
-      traceWalletSetupMessage(`SimplifiedFetchTransport.send ${messageType} ${baseUrl} failed in ${Date.now() - started}ms: ${formatError(error)}`);
-      throw error;
-    } finally {
-      if (originalFetchClient != null) this.fetchClient = originalFetchClient;
-    }
-  };
-
-  prototype.__carsTransportTracePatch = true;
-}
-
-type AuthFetchAdapterMode = 'auto' | 'axios' | 'curl' | 'fetch';
-
-function authFetchAdapterMode(): AuthFetchAdapterMode {
-  const mode = (process.env.CARS_AUTH_FETCH_ADAPTER || 'curl').toLowerCase();
-  if (mode === 'fetch' || mode === 'native' || mode === 'none') return 'fetch';
-  if (mode === 'curl') return 'curl';
-  if (mode === 'axios' || mode === '1' || mode === 'true') return 'axios';
-  return 'auto';
-}
-
-async function sendWithAuthFetchAdapter(
-  originalFetchClient: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
-  input: RequestInfo | URL,
-  init: RequestInit,
-  url: URL
-): Promise<Response> {
-  const mode = authFetchAdapterMode();
-  if (mode === 'fetch') return await originalFetchClient(input, init);
-  if (mode === 'curl') return await curlFetchAdapter(input, init);
-  if (mode === 'axios') return await axiosFetchAdapter(input, init);
-
-  try {
-    return await axiosFetchAdapter(input, init);
-  } catch (error) {
-    if (!isRetryableError(error)) throw error;
-    traceWalletSetupMessage(`SimplifiedFetchTransport.fetch ${url.origin}${url.pathname} axios adapter failed; retrying with curl adapter: ${formatError(error)}`);
-    return await curlFetchAdapter(input, init);
-  }
-}
-
-async function axiosFetchAdapter(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const url = typeof input === 'string' || input instanceof URL
-    ? String(input)
-    : input.url;
-  const inputMethod = typeof input === 'object' && 'method' in input ? input.method : undefined;
-  const inputHeaders = typeof input === 'object' && 'headers' in input ? input.headers : undefined;
-  const inputBody = typeof input === 'object' && 'body' in input ? input.body : undefined;
-  const method = init?.method ?? inputMethod ?? 'GET';
-  const headers = headersToRecord(init?.headers ?? inputHeaders);
-  const data = init?.body ?? inputBody;
-
-  const response = await axios.request<ArrayBuffer>({
-    method: method as any,
-    url,
-    headers,
-    data,
-    responseType: 'arraybuffer',
-    timeout: AUTH_FETCH_TIMEOUT_MS,
-    signal: init?.signal,
-    validateStatus: () => true
-  });
-
-  const body = response.data instanceof ArrayBuffer
-    ? Buffer.from(response.data)
-    : Buffer.from(response.data as any);
-
-  return makeFetchResponse({
-    url,
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-    body
-  });
-}
-
-async function curlFetchAdapter(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const url = typeof input === 'string' || input instanceof URL
-    ? String(input)
-    : input.url;
-  const inputMethod = typeof input === 'object' && 'method' in input ? input.method : undefined;
-  const inputHeaders = typeof input === 'object' && 'headers' in input ? input.headers : undefined;
-  const inputBody = typeof input === 'object' && 'body' in input ? input.body : undefined;
-  const method = init?.method ?? inputMethod ?? 'GET';
-  const headers = headersToRecord(init?.headers ?? inputHeaders);
-  const data = init?.body ?? inputBody;
-  const tempDir = fs.mkdtempSync(path.join(process.cwd(), '.cars-curl-'));
-  const headerPath = path.join(tempDir, 'headers');
-  const bodyPath = path.join(tempDir, 'body');
-
-  try {
-    const args = [
-      '--silent',
-      '--show-error',
-      '--location',
-      '--max-time', String(Math.ceil(AUTH_FETCH_TIMEOUT_MS / 1000)),
-      '--request', String(method),
-      '--dump-header', headerPath,
-      '--output', bodyPath,
-      '--write-out', '%{http_code}',
-      url
-    ];
-
-    for (const [key, value] of Object.entries(headers)) {
-      args.push('--header', `${key}: ${value}`);
-    }
-
-    let inputData: Buffer | string | undefined;
-    if (data != null) {
-      args.push('--data-binary', '@-');
-      inputData = bodyToCurlInput(data);
-    }
-
-    const result = spawnSync('curl', args, {
-      input: inputData,
-      encoding: inputData == null || Buffer.isBuffer(inputData) ? 'buffer' : 'utf8',
-      maxBuffer: 25 * 1024 * 1024
-    });
-
-    if (result.error) throw result.error;
-    if (result.status !== 0) {
-      const stderr = Buffer.isBuffer(result.stderr) ? result.stderr.toString('utf8') : String(result.stderr || '');
-      throw new Error(`curl exited ${result.status}${stderr ? `: ${stderr.trim()}` : ''}`);
-    }
-
-    const statusText = Buffer.isBuffer(result.stdout) ? result.stdout.toString('utf8') : String(result.stdout || '');
-    const status = parseInt(statusText.trim().slice(-3), 10);
-    const body = fs.existsSync(bodyPath) ? fs.readFileSync(bodyPath) : Buffer.alloc(0);
-    const rawHeaders = fs.existsSync(headerPath) ? fs.readFileSync(headerPath, 'utf8') : '';
-
-    return makeFetchResponse({
-      url,
-      status: Number.isFinite(status) ? status : 0,
-      statusText: '',
-      headers: parseCurlHeaders(rawHeaders),
-      body
-    });
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-  }
-}
-
-function makeFetchResponse(details: {
-  url: string;
-  status: number;
-  statusText: string;
-  headers: any;
-  body: Buffer;
-}): Response {
-  const { url, status, statusText, headers, body } = details;
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    statusText,
-    url,
-    redirected: false,
-    type: 'basic',
-    headers: new AdapterFetchHeaders(headers),
-    clone: () => {
-      throw new Error('CARS fetch adapter response clone is not implemented');
-    },
-    arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
-    blob: async () => new Blob([body]),
-    formData: async () => {
-      throw new Error('CARS axios fetch adapter response formData is not implemented');
-    },
-    json: async () => JSON.parse(body.toString('utf8')),
-    text: async () => body.toString('utf8'),
-    body: null,
-    bodyUsed: false
-  } as unknown as Response;
-}
-
-function bodyToCurlInput(body: BodyInit): Buffer | string {
-  if (typeof body === 'string') return body;
-  if (Buffer.isBuffer(body)) return body;
-  if (body instanceof ArrayBuffer) return Buffer.from(body);
-  if (ArrayBuffer.isView(body)) return Buffer.from(body.buffer, body.byteOffset, body.byteLength);
-  return String(body);
-}
-
-function parseCurlHeaders(rawHeaders: string): Record<string, string> {
-  const blocks = rawHeaders.trim().split(/\r?\n\r?\n/).filter(Boolean);
-  const lastBlock = blocks[blocks.length - 1] || '';
-  const headers: Record<string, string> = {};
-  for (const line of lastBlock.split(/\r?\n/).slice(1)) {
-    const separator = line.indexOf(':');
-    if (separator <= 0) continue;
-    headers[line.slice(0, separator).trim().toLowerCase()] = line.slice(separator + 1).trim();
-  }
-  return headers;
-}
-
-function headersToRecord(headers: HeadersInit | undefined): Record<string, string> {
-  if (headers == null) return {};
-  if (headers instanceof Headers) return Object.fromEntries(headers.entries());
-  if (Array.isArray(headers)) return Object.fromEntries(headers.map(([key, value]) => [key, value]));
-  return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key, String(value)]));
-}
-
-class AdapterFetchHeaders {
-  constructor(private readonly headers: any) {}
-
-  get(name: string): string | null {
-    const value = this.headers?.[name.toLowerCase()] ?? this.headers?.[name];
-    if (Array.isArray(value)) return value.join(', ');
-    return value == null ? null : String(value);
-  }
-
-  has(name: string): boolean {
-    return this.get(name) != null;
-  }
-
-  forEach(callback: (value: string, key: string) => void) {
-    for (const [key, value] of Object.entries(this.headers || {})) {
-      callback(Array.isArray(value) ? value.join(', ') : String(value), key);
-    }
-  }
-}
-
 function walletSetupTraceEnabled(): boolean {
   return process.env.CARS_WALLET_SETUP_TRACE !== '0';
-}
-
-function traceWalletSetupMessage(message: string) {
-  if (!walletSetupTraceEnabled()) return;
-  console.log(chalk.gray(`CARS wallet setup: ${message}`));
-}
-
-async function createPrintableNonce(wallet: WalletInterface, originator?: string): Promise<string> {
-  const firstHalf = Array.from(crypto.randomBytes(16), value => 33 + (value % 94));
-  const keyID = Buffer.from(firstHalf).toString('utf8');
-  const { hmac } = await wallet.createHmac({
-    protocolID: [2, 'server hmac'],
-    keyID,
-    data: firstHalf,
-    counterparty: 'self'
-  }, originator);
-  return Buffer.from([...firstHalf, ...hmac]).toString('base64');
 }
 
 /**
@@ -664,7 +303,6 @@ const REQUEST_TIMEOUT_MS = parsePositiveInt(process.env.CARS_REQUEST_TIMEOUT_MS,
 const CONNECT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_CONNECT_TIMEOUT_MS, REQUEST_TIMEOUT_MS);
 const PREFLIGHT_TIMEOUT_MS = parsePositiveInt(process.env.CARS_PREFLIGHT_TIMEOUT_MS, 15000);
 const WALLET_STORAGE_TIMEOUT_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_TIMEOUT_MS, Math.min(REQUEST_TIMEOUT_MS, 120000));
-const AUTH_FETCH_TIMEOUT_MS = parsePositiveInt(process.env.CARS_AUTH_FETCH_TIMEOUT_MS, Math.min(REQUEST_TIMEOUT_MS, 20000));
 const REQUEST_RETRIES = parsePositiveInt(process.env.CARS_REQUEST_RETRIES, 3);
 const WALLET_STORAGE_ATTEMPTS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_ATTEMPTS, 3);
 const WALLET_STORAGE_RETRY_DELAY_MS = parsePositiveInt(process.env.CARS_WALLET_STORAGE_RETRY_DELAY_MS, 3000);
@@ -4007,7 +3645,7 @@ program
   });
 
 // If `cars` is invoked without args, enter the main menu
-(async function main() {
+async function main() {
   if (process.argv.length <= 2) {
     if (!fs.existsSync(CONFIG_PATH)) {
       console.log(chalk.yellow('No deployment-info.json found. Creating a basic one.'));
@@ -4029,4 +3667,9 @@ program
   } else {
     program.parse(process.argv);
   }
-})();
+}
+
+// Importing the CLI for runtime compatibility tests must not start a command.
+if (process.argv[1] && pathToFileURL(fs.realpathSync(process.argv[1])).href === import.meta.url) {
+  void main();
+}
